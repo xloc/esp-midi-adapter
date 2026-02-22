@@ -1,0 +1,12 @@
+.vscode/
+.DS_Store
+
+# ESP-IDF / CMake build output
+build/
+managed_components/
+
+# Local project configuration (commit sdkconfig.defaults instead)
+sdkconfig
+sdkconfig.old
+
+
