@@ -1,0 +1,10 @@
+# ESP MIDI Adapter
+
+USB Host MIDI to BLE MIDI bridge for M5Stack AtomS3.
+
+## Build
+
+```fish
+./build.fish build flash monitor
+./build.fish fullclean
+```

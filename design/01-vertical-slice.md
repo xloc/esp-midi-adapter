@@ -2,22 +2,22 @@
 
 ## Goal
 
-Configure ESP32-S3 as USB Host, receive MIDI from a keyboard, print to console, blink LED.
+Configure ESP32-S3 as USB Host, receive MIDI from a keyboard, print to console, toggle LCD backlight.
 
 ## Scope
 
 1. **USB Host** - ESP32-S3 recognizes a USB MIDI device
 2. **MIDI Parse** - Extract Note On/Off messages
 3. **Output** - Print note info to serial console
-4. **Feedback** - Blink LED on each note received
+4. **Feedback** - Toggle LCD backlight on each note received
 
 ## Tasks
 
 ### 1. Dev Environment Setup
-- [ ] ESP-IDF installed and working
-- [ ] Project scaffold with CMakeLists.txt
-- [ ] `idf.py build` succeeds (empty main)
-- [ ] Can flash to ESP32-S3 dev board
+- [x] ESP-IDF v5.2 installed and working
+- [x] Project scaffold with CMakeLists.txt
+- [x] `idf.py build` succeeds
+- [x] Can flash to AtomS3 dev board
 
 ### 2. USB Host MIDI
 - [ ] Initialize USB Host stack
@@ -26,24 +26,25 @@ Configure ESP32-S3 as USB Host, receive MIDI from a keyboard, print to console, 
 - [ ] Parse Note On/Off from USB MIDI packet
 - [ ] Log note number and velocity to serial console
 
-### 3. LED Feedback
-- [ ] Configure RGB LED via GPIO35 (SK6812 addressable LED, needs RMT driver)
-- [ ] Blink LED when note received
+### 3. Backlight Feedback
+- [x] Configure LCD backlight via GPIO16 (simple GPIO output)
+- [ ] Toggle backlight when note received
 
 ## Acceptance Test
 
-1. Flash firmware to ESP32-S3
-2. Connect USB MIDI keyboard to ESP32-S3 USB port
+1. Flash firmware to AtomS3
+2. Connect USB MIDI keyboard to AtomS3 USB-C port
 3. Open serial monitor
 4. Press key on keyboard
 5. See note info printed (e.g., "Note On: 60, velocity: 100")
-6. LED blinks
+6. LCD backlight toggles on/off
 
 ## Notes
 
 - No BLE yet - that's slice 02
 - Just Note On/Off for now, ignore CC, pitch bend, etc.
 - Hard-code everything possible
-- Hardware: M5Stack Atom S3
-  - Front button (below screen): GPIO41
-  - RGB LED: GPIO35 (SK6812 addressable)
+- Hardware: M5Stack AtomS3 (with 0.85" LCD)
+  - Front button: GPIO41
+  - LCD Backlight: GPIO16 (simple GPIO, no RGB LED on this model)
+  - USB-C: Can be configured as USB Host (OTG)
