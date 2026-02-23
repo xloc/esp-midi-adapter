@@ -2,9 +2,11 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "nvs_flash.h"
+#include "usb/usb_host.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -12,9 +14,12 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
-#define BUTTON_GPIO 41
+#define BACKLIGHT_GPIO 16
 
-static const char *TAG = "BLE_MIDI";
+static const char *TAG = "MIDI";
+
+// Blink count: 1=init, 2=waiting, 3=device found, 0=MIDI ready
+static volatile int blink_count = 1;
 
 // BLE MIDI Service: 03B80E5A-EDE8-4B33-A751-6CE34EC4C700 (little-endian)
 static const ble_uuid128_t midi_svc_uuid =
@@ -33,11 +38,62 @@ static bool ble_connected;
 static bool ble_subscribed;
 static uint8_t ble_addr_type;
 
+// USB MIDI state
+typedef struct {
+    usb_host_client_handle_t client_hdl;
+    usb_device_handle_t dev_hdl;
+    usb_transfer_t *transfer;
+    uint8_t dev_addr;
+    uint8_t ep_addr;
+    bool connected;
+} usb_midi_state_t;
+
+static usb_midi_state_t usb_midi;
+
 // Forward declarations
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
 static void ble_advertise(void);
 
-// GATT access callback (minimal - reads return empty, writes ignored)
+// ----------------------------------------------------------------------------
+// Backlight
+// ----------------------------------------------------------------------------
+
+static void init_backlight(void) {
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << BACKLIGHT_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&cfg);
+}
+
+static void set_backlight(bool on) {
+    gpio_set_level(BACKLIGHT_GPIO, on ? 1 : 0);
+}
+
+static void blink_pattern(int count) {
+    for (int i = 0; i < count; i++) {
+        set_backlight(true);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        set_backlight(false);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    vTaskDelay(pdMS_TO_TICKS(600));
+}
+
+static void blink_task(void *arg) {
+    while (1) {
+        if (blink_count > 0) {
+            blink_pattern(blink_count);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// BLE MIDI
+// ----------------------------------------------------------------------------
+
 static int midi_chr_access(uint16_t conn_handle, uint16_t attr_handle,
                            struct ble_gatt_access_ctxt *ctxt, void *arg) {
     return 0;
@@ -187,42 +243,173 @@ static void send_midi_note(uint8_t note, uint8_t velocity, bool on) {
     ESP_LOGI(TAG, "Sent %s note=%d vel=%d rc=%d", on ? "NoteOn" : "NoteOff", note, velocity, rc);
 }
 
-static void button_task(void *arg) {
-    gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << BUTTON_GPIO),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-    };
-    gpio_config(&cfg);
+// ----------------------------------------------------------------------------
+// USB Host MIDI
+// ----------------------------------------------------------------------------
 
-    bool last_pressed = false;
+static void parse_midi(const uint8_t *data, int len) {
+    for (int i = 0; i + 3 < len; i += 4) {
+        uint8_t cin = data[i] & 0x0F;
+        uint8_t note = data[i + 2];
+        uint8_t velocity = data[i + 3];
 
-    while (1) {
-        bool pressed = !gpio_get_level(BUTTON_GPIO);  // Active low
-
-        if (pressed != last_pressed) {
-            vTaskDelay(pdMS_TO_TICKS(50));  // Debounce
-            pressed = !gpio_get_level(BUTTON_GPIO);
-
-            if (pressed != last_pressed) {
-                last_pressed = pressed;
-                if (pressed) {
-                    ESP_LOGI(TAG, "Button pressed");
-                    send_midi_note(60, 100, true);   // Middle C
-                } else {
-                    ESP_LOGI(TAG, "Button released");
-                    send_midi_note(60, 0, false);
-                }
-            }
+        if (cin == 0x09 && velocity > 0) {
+            ESP_LOGI(TAG, "Note On: %d, velocity: %d", note, velocity);
+            set_backlight(true);
+            send_midi_note(note, velocity, true);
+        } else if (cin == 0x08 || (cin == 0x09 && velocity == 0)) {
+            ESP_LOGI(TAG, "Note Off: %d", note);
+            set_backlight(false);
+            send_midi_note(note, 0, false);
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-void app_main(void) {
-    ESP_LOGI(TAG, "ESP MIDI Adapter - BLE MIDI");
+static void transfer_cb(usb_transfer_t *transfer) {
+    if (transfer->status == USB_TRANSFER_STATUS_COMPLETED && transfer->actual_num_bytes > 0) {
+        parse_midi(transfer->data_buffer, transfer->actual_num_bytes);
+    }
+    if (usb_midi.connected) {
+        usb_host_transfer_submit(transfer);
+    }
+}
 
-    // Initialize NVS (required for BLE)
+static bool find_midi_endpoint(const usb_config_desc_t *config_desc, uint8_t *intf_num, uint8_t *alt_setting, uint8_t *ep_addr) {
+    const uint8_t *p = (const uint8_t *)config_desc;
+    const uint8_t *end = p + config_desc->wTotalLength;
+    bool in_midi_interface = false;
+    uint8_t current_intf_num = 0;
+    uint8_t current_alt = 0;
+
+    while (p < end && p[0] > 0) {
+        uint8_t len = p[0];
+        uint8_t type = p[1];
+
+        if (type == USB_B_DESCRIPTOR_TYPE_INTERFACE && len >= 9) {
+            const usb_intf_desc_t *intf = (const usb_intf_desc_t *)p;
+            in_midi_interface = false;
+
+            if (intf->bInterfaceClass == 0x01 &&
+                intf->bInterfaceSubClass == 0x03 &&
+                intf->bNumEndpoints > 0) {
+                in_midi_interface = true;
+                current_intf_num = intf->bInterfaceNumber;
+                current_alt = intf->bAlternateSetting;
+            }
+        } else if (type == USB_B_DESCRIPTOR_TYPE_ENDPOINT && len >= 7 && in_midi_interface) {
+            const usb_ep_desc_t *ep = (const usb_ep_desc_t *)p;
+            if (ep->bEndpointAddress & 0x80) {
+                *intf_num = current_intf_num;
+                *alt_setting = current_alt;
+                *ep_addr = ep->bEndpointAddress;
+                return true;
+            }
+        }
+
+        p += len;
+    }
+
+    return false;
+}
+
+static void client_event_cb(const usb_host_client_event_msg_t *msg, void *arg) {
+    usb_midi_state_t *state = (usb_midi_state_t *)arg;
+    if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
+        state->dev_addr = msg->new_dev.address;
+        blink_count = 3;
+    } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+        state->connected = false;
+        blink_count = 2;
+    }
+}
+
+static void midi_task(void *arg) {
+    SemaphoreHandle_t ready = (SemaphoreHandle_t)arg;
+    xSemaphoreTake(ready, portMAX_DELAY);
+
+    usb_host_client_config_t client_cfg = {
+        .is_synchronous = false,
+        .max_num_event_msg = 5,
+        .async = {
+            .client_event_callback = client_event_cb,
+            .callback_arg = &usb_midi,
+        },
+    };
+    ESP_ERROR_CHECK(usb_host_client_register(&client_cfg, &usb_midi.client_hdl));
+    ESP_LOGI(TAG, "USB client registered, waiting for MIDI device...");
+
+    while (1) {
+        usb_host_client_handle_events(usb_midi.client_hdl, portMAX_DELAY);
+
+        if (usb_midi.dev_addr && !usb_midi.connected) {
+            if (usb_host_device_open(usb_midi.client_hdl, usb_midi.dev_addr, &usb_midi.dev_hdl) != ESP_OK) {
+                usb_midi.dev_addr = 0;
+                continue;
+            }
+
+            const usb_config_desc_t *config_desc;
+            if (usb_host_get_active_config_descriptor(usb_midi.dev_hdl, &config_desc) != ESP_OK) {
+                usb_host_device_close(usb_midi.client_hdl, usb_midi.dev_hdl);
+                usb_midi.dev_addr = 0;
+                continue;
+            }
+
+            uint8_t intf_num, alt_setting;
+            if (!find_midi_endpoint(config_desc, &intf_num, &alt_setting, &usb_midi.ep_addr)) {
+                ESP_LOGW(TAG, "Not a MIDI device");
+                usb_host_device_close(usb_midi.client_hdl, usb_midi.dev_hdl);
+                usb_midi.dev_addr = 0;
+                continue;
+            }
+
+            if (usb_host_interface_claim(usb_midi.client_hdl, usb_midi.dev_hdl, intf_num, alt_setting) != ESP_OK) {
+                usb_host_device_close(usb_midi.client_hdl, usb_midi.dev_hdl);
+                usb_midi.dev_addr = 0;
+                continue;
+            }
+
+            ESP_ERROR_CHECK(usb_host_transfer_alloc(64, 0, &usb_midi.transfer));
+            usb_midi.transfer->device_handle = usb_midi.dev_hdl;
+            usb_midi.transfer->bEndpointAddress = usb_midi.ep_addr;
+            usb_midi.transfer->callback = transfer_cb;
+            usb_midi.transfer->num_bytes = 64;
+
+            usb_midi.connected = true;
+            blink_count = 0;
+            ESP_LOGI(TAG, "MIDI device connected!");
+
+            usb_host_transfer_submit(usb_midi.transfer);
+        }
+    }
+}
+
+static void usb_host_task(void *arg) {
+    SemaphoreHandle_t ready = (SemaphoreHandle_t)arg;
+
+    usb_host_config_t host_cfg = {
+        .skip_phy_setup = false,
+        .intr_flags = ESP_INTR_FLAG_LEVEL1,
+    };
+    ESP_ERROR_CHECK(usb_host_install(&host_cfg));
+    ESP_LOGI(TAG, "USB Host installed");
+    blink_count = 2;
+
+    xSemaphoreGive(ready);
+
+    while (1) {
+        uint32_t event_flags;
+        usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Main
+// ----------------------------------------------------------------------------
+
+void app_main(void) {
+    ESP_LOGI(TAG, "ESP MIDI Adapter - USB to BLE Bridge");
+
+    // NVS (required for BLE)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -230,13 +417,16 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // Initialize NimBLE
+    // Backlight
+    init_backlight();
+
+    // BLE MIDI
     ret = nimble_port_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "nimble_port_init failed: %d", ret);
         return;
     }
-
+    
     ble_hs_cfg.sync_cb = ble_on_sync;
     ble_hs_cfg.reset_cb = ble_on_reset;
 
@@ -247,6 +437,9 @@ void app_main(void) {
     // Start BLE host task
     nimble_port_freertos_init(ble_host_task);
 
-    // Start button task
-    xTaskCreate(button_task, "button", 4096, NULL, 1, NULL);
+    // USB Host MIDI
+    SemaphoreHandle_t usb_ready = xSemaphoreCreateBinary();
+    xTaskCreate(blink_task, "blink", 2048, NULL, 1, NULL);
+    xTaskCreatePinnedToCore(usb_host_task, "usb_host", 4096, usb_ready, 2, NULL, 0);
+    xTaskCreatePinnedToCore(midi_task, "midi", 4096, usb_ready, 3, NULL, 0);
 }
