@@ -20,15 +20,15 @@ Configure ESP32-S3 as USB Host, receive MIDI from a keyboard, print to console, 
 - [x] Can flash to AtomS3 dev board
 
 ### 2. USB Host MIDI
-- [ ] Initialize USB Host stack
-- [ ] Detect when MIDI device is plugged in
-- [ ] Read raw USB packets from MIDI device
-- [ ] Parse Note On/Off from USB MIDI packet
-- [ ] Log note number and velocity to serial console
+- [x] Initialize USB Host stack
+- [x] Detect when MIDI device is plugged in
+- [x] Read raw USB packets from MIDI device
+- [x] Parse Note On/Off from USB MIDI packet
+- [x] Log note number and velocity to serial console
 
 ### 3. Backlight Feedback
 - [x] Configure LCD backlight via GPIO16 (simple GPIO output)
-- [ ] Toggle backlight when note received
+- [x] Toggle backlight when note received
 
 ## Acceptance Test
 

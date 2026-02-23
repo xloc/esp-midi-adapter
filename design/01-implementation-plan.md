@@ -20,7 +20,7 @@ Implement USB Host MIDI input with LCD backlight feedback on M5Stack AtomS3 (ESP
 | Project scaffold | ✅ Working |
 | Build system | ✅ Working (`./build.fish build`) |
 | LCD Backlight control | ✅ Tested and working |
-| USB Host MIDI | ❌ Not working - needs debugging |
+| USB Host MIDI | ✅ Working |
 
 ## Files
 
@@ -60,9 +60,9 @@ static void set_backlight(bool on) {
 }
 ```
 
-### USB Host MIDI (Not Working - Needs Debug)
+### USB Host MIDI (Working)
 
-**Current implementation:**
+**Implementation:**
 1. `usb_host_install()` - installs USB host library
 2. `usb_host_client_register()` - registers MIDI client
 3. Wait for `USB_HOST_CLIENT_EVENT_NEW_DEV`
@@ -70,12 +70,6 @@ static void set_backlight(bool on) {
 5. Find MIDI interface (class 0x01, subclass 0x03)
 6. Find bulk IN endpoint
 7. Claim interface, allocate transfer, submit
-
-**Possible issues to investigate:**
-- USB OTG pin configuration for host mode
-- Power delivery to USB device
-- Device enumeration not happening
-- Need to check serial monitor for error messages
 
 ### MIDI Parsing
 USB MIDI packet = 4 bytes:
@@ -86,10 +80,7 @@ USB MIDI packet = 4 bytes:
 
 ## Next Steps
 
-1. **Debug USB Host**: Check serial output for errors when MIDI device connected
-2. **Verify USB OTG**: May need sdkconfig changes for USB Host mode
-3. **Check power**: AtomS3 may not supply enough power via USB-C for MIDI keyboard
-4. **Test with simple USB device first**: Try detecting any USB device before MIDI-specific code
+Slice 01 complete. Proceed to Slice 02 (BLE MIDI output).
 
 ## Reference Files
 
